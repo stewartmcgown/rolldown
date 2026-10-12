@@ -172,6 +172,12 @@ impl GenerateStage<'_> {
     // mid-cycle), which is the standing correctness proof; the extra wrapping is bounded to
     // emergent-cycle members, the at-risk set only grows, and it is finite — so this converges.
     //
+    // The same fixpoint wraps every eager module whose wrapper would forward `init_*` to a planned
+    // module (`wrap_all_forwarded_targets`): each round intersects those precomputed obligations
+    // with the current plan, so a chain of forwarders closes one hop per round and the at-risk set
+    // still only grows. See
+    // internal-docs/code-splitting/design.md#emergent-cycle-plan-projection-on-demand.
+    //
     // Both inputs below are plan-independent, so they are computed once for every plan rebuild:
     // the roots never change across rounds, and the reverse index inverts the static module graph,
     // not anything the plan mints.
@@ -205,6 +211,12 @@ impl GenerateStage<'_> {
     // The at-risk set is monotone and finite; this bound only guards against a logic error.
     let iteration_cap = self.link_output.module_table.modules.len() + 1;
     let mut iterations = 0usize;
+    let forwarded_targets = self.wrap_all_forwarded_targets(
+      chunk_graph,
+      &source_reachable,
+      used_symbol_refs_builder,
+      &reverse_static_imports,
+    );
     loop {
       // Project the chunk edges the current plan's lowering will add — the `init_*` forwarding
       // imports of wrapped modules — on top of the pre-lowering baseline, then find the chunk
@@ -220,20 +232,31 @@ impl GenerateStage<'_> {
       // Mark every eligible module hosted in an emergent cyclic chunk at-risk. Wrapping them all
       // (not only the order-sensitive ones) removes every eager body from those chunks, matching the
       // wrap-all shape that is provably safe under cyclic evaluation. `all_at_risk` only grows.
-      let mut added = 0usize;
+      let mut cyclic = 0usize;
       for scc in &post_cycles.sccs {
         for &chunk_idx in scc {
           for &module_idx in &chunk_graph.chunk_table[chunk_idx].modules {
             if self.is_order_wrap_eligible(module_idx) && all_at_risk.insert(module_idx) {
-              added += 1;
+              cyclic += 1;
             }
           }
         }
       }
+      // Eager forwarders whose wrapper would initialize a planned module.
+      let mut forwarding = 0usize;
+      for (module_idx, targets) in &forwarded_targets {
+        if !plan.contains(module_idx)
+          && targets.iter().any(|target_idx| plan.contains(target_idx))
+          && all_at_risk.insert(*module_idx)
+        {
+          forwarding += 1;
+        }
+      }
+      let added = cyclic + forwarding;
       iterations += 1;
       order_debug_trace(|| {
         format!(
-          "[order] fixpoint round {iterations}: {} emergent cyclic chunk SCC(s), +{added} at-risk (total {})",
+          "[order] fixpoint round {iterations}: {} emergent cyclic chunk SCC(s), +{cyclic} cyclic and +{forwarding} forwarding at-risk (total {})",
           post_cycles.sccs.len(),
           all_at_risk.len(),
         )
@@ -582,6 +605,62 @@ impl GenerateStage<'_> {
         &|module_idx| chunk_graph.module_to_chunk[module_idx] == Some(importer_chunk),
       );
     }
+  }
+
+  /// For every eager-eligible source-reachable module, the planned-eligible modules its wrapper
+  /// would initialize through a tree-shaken re-export hop or a retained re-export path: the
+  /// excluded-statement obligations the final metadata pass assigns to a wrapper. Resolved against
+  /// a wrap-all probe, not the current plan: a hop belongs to the first wrapped barrel on its path,
+  /// so only a probe that wraps the forwarder itself shows what its wrapper would own. Modules
+  /// with no such obligation are omitted. See
+  /// internal-docs/code-splitting/design.md#emergent-cycle-plan-projection-on-demand.
+  fn wrap_all_forwarded_targets(
+    &self,
+    chunk_graph: &ChunkGraph,
+    source_reachable: &FxHashSet<ModuleIdx>,
+    used_symbol_refs_builder: &UsedSymbolRefsBuilder,
+    reverse_static_imports: &IndexVec<ModuleIdx, Vec<ModuleIdx>>,
+  ) -> Vec<(ModuleIdx, Vec<ModuleIdx>)> {
+    let wrap_all_plan = self.wrap_all_order_analysis().plan;
+    let wrap_all_probe = self.probe_order_state(
+      Some(chunk_graph),
+      &wrap_all_plan,
+      used_symbol_refs_builder,
+      reverse_static_imports,
+    );
+    let metadata = self.compute_wrapped_esm_init_metadata(
+      &self.ast_table,
+      chunk_graph,
+      &wrap_all_probe,
+      used_symbol_refs_builder.view(),
+    );
+    self
+      .link_output
+      .module_table
+      .modules
+      .iter()
+      .filter_map(Module::as_normal)
+      .filter(|module| {
+        source_reachable.contains(&module.idx) && self.is_order_wrap_eligible(module.idx)
+      })
+      .filter_map(|module| {
+        let targets = metadata
+          .transitive_init_targets(module.idx)?
+          .values()
+          .flatten()
+          .filter_map(|target| match target {
+            WrappedEsmInitTarget::Module(target_idx)
+              if wrap_all_probe.has_order_wrapper(*target_idx) =>
+            {
+              Some(*target_idx)
+            }
+            WrappedEsmInitTarget::Module(_) | WrappedEsmInitTarget::CjsCarrier(_) => None,
+          })
+          .unique()
+          .collect_vec();
+        (!targets.is_empty()).then_some((module.idx, targets))
+      })
+      .collect()
   }
 
   /// A discovery-only [`OrderWrapState`] that marks exactly the plan's modules order-wrapped, so
